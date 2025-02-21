@@ -7,8 +7,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class BufferBatch {
     static int BATCH_SIZE = 1024; // Define batch size
-    private final ArrayBlockingQueue<ByteBuffer> byteBuffers;
-    private final CountDownLatch doneSignal;
+     final ArrayBlockingQueue<ByteBuffer> byteBuffers;
+     final CountDownLatch doneSignal;
     private volatile boolean batchFinalized;
 
     BufferBatch() {

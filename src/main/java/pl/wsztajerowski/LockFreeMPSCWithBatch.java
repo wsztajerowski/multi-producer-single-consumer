@@ -10,8 +10,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 
 public class LockFreeMPSCWithBatch {
-    private final Queue<BufferBatch> queue = new ConcurrentLinkedQueue<>();
-    private final AtomicReference<BufferBatch> currentBatchReference = new AtomicReference<>();
+
+    private final AtomicReference<BufferBatch> currentBatchReference = new AtomicReference<>(new BufferBatch());
     private final ExecutorService consumerExecutor = Executors.newSingleThreadExecutor();
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
     private final Consumer<ByteBuffer[]> processor;
@@ -19,9 +19,6 @@ public class LockFreeMPSCWithBatch {
 
     public LockFreeMPSCWithBatch(Consumer<ByteBuffer[]> processor) {
         this.processor = processor;
-        BufferBatch newValue = new BufferBatch();
-        currentBatchReference.set(newValue);
-        queue.add(newValue);
     }
 
     public void stopConsumer() throws InterruptedException {
@@ -30,23 +27,25 @@ public class LockFreeMPSCWithBatch {
     }
 
     public void startConsumer() {
+
+
         consumerExecutor.submit(() -> {
             while (consumerAlive.get()) {
-                BufferBatch peek = queue.peek();
-                if (peek == null || peek.isBatchEmpty()) {
-                    // smart sleep? Wait for semaphore / signal?
-                    System.out.println("Batch is empty");
-                    Thread.onSpinWait();
-                    continue;
+
+                var bufferBatch = currentBatchReference.get();
+
+                var batchEmpty = bufferBatch.isBatchEmpty();
+
+                if (!batchEmpty) {
+                    lock.writeLock().lock();
+                    try {
+                        bufferBatch.finalizeBatch();
+                    } finally {
+                        lock.writeLock().unlock();
+                    }
+                    currentBatchReference.set(new BufferBatch());
+                    processBatch(bufferBatch);
                 }
-                BufferBatch polledBatch = queue.poll();
-                lock.writeLock().lock();
-                try {
-                    polledBatch.finalizeBatch();
-                } finally {
-                    lock.writeLock().unlock();
-                }
-                processBatch(polledBatch);
             }
             System.out.println("Consumer stopped");
         });
@@ -58,41 +57,34 @@ public class LockFreeMPSCWithBatch {
         polledBatch.sendDoneSignal();
     }
 
-    public CountDownLatch forceProduce(ByteBuffer content){
-        while (true){
-            CountDownLatch countDownLatch = produce(content);
-            if (countDownLatch != null) {
-                return countDownLatch;
+    public void produce(ByteBuffer content) {
+
+        while (true) { //lock-free loop
+            var bufferBatch = currentBatchReference.get();
+            var batchFinalized = bufferBatch.isBatchFinalized();
+
+
+            if (!batchFinalized) {
+                lock.readLock().lock();
+                // <-- tu OS scheduler może odjebać
+                try {
+                    batchFinalized = bufferBatch.isBatchFinalized();
+                    if (!batchFinalized) {
+                        if (bufferBatch.byteBuffers.offer(content)) {
+                            try {
+                                bufferBatch.doneSignal.await();
+                                return;
+                            } catch (InterruptedException e) {
+                                throw new RuntimeException(e);
+                            }
+                        }
+                    }
+                } finally {
+                    lock.readLock().unlock();
+                }
             }
         }
-    }
 
-    public Queue<BufferBatch> getQueue() {
-        return queue;
-    }
-
-    public CountDownLatch produce(ByteBuffer content) {
-        BufferBatch currentBatch;
-        CountDownLatch doneSignal;
-        lock.readLock().lock();
-        try {
-            currentBatch = currentBatchReference.get();
-            doneSignal = currentBatch.offer(content);
-        } finally {
-            lock.readLock().unlock();
-        }
-        if (doneSignal == null) {
-            System.out.println("Batch is closed");
-            BufferBatch newBatch = new BufferBatch();
-            BufferBatch bufferBatch = currentBatchReference.compareAndExchange(currentBatch, newBatch);
-
-            if (currentBatch.equals(bufferBatch)) {
-                queue.add(newBatch);
-            }
-        }
-        return doneSignal;
     }
 
 }
-
-
